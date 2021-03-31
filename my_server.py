@@ -40,7 +40,7 @@ class MyResolver(DnsResolver):
             q.answers = []
             return q.to_bytes()
 
-
+        """
         ### PseudoCode ###
         # DNS Functions: https://tools.ietf.org/html/rfc1034#section-5.2.1
         # host name -> host address  <- implementing this one
@@ -85,7 +85,7 @@ class MyResolver(DnsResolver):
         #if slist is null or we can't find ans yet
         for ns in sbelt:
             recursive_lookup(...)
-			
+        """
         ### Regular Query
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.bind(("", 7000))
@@ -99,9 +99,10 @@ class MyResolver(DnsResolver):
         # print(a.to_bytes())
         return a.to_bytes()
 
-	def lookup(self, qname: str):
+	def lookup(self, qname: str, ns):
         """
         setups and sends a dns query to a name server 
+
         returns query
         """
 		sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
