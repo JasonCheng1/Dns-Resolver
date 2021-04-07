@@ -1,5 +1,6 @@
 # Abraham Gale 2020
 # feel free to add functions to this part of the project, just make sure that the get_dns_response function works
+from os import WIFSTOPPED
 from resolver_backround import DnsResolver
 import threading
 import socket
@@ -9,7 +10,7 @@ from sys import argv
 from time import sleep
 from helper_funcs import DNSQuery
 from datetime import datetime, timedelta
-from collections import OrderedDict
+from collections import defaultdict, OrderedDict
 
 MAX_LEVEL = 10  # max number of iterative queries we make before we stop
 CACHE_SIZE = 10000
@@ -22,7 +23,7 @@ class LRUCache:
 
     def get(self, key):
         if key not in self.cache:
-            return -1
+            return None
         val = self.cache[key]
         self.cache.move_to_end(key)
         return val
@@ -40,10 +41,7 @@ class MyResolver(DnsResolver):
         self.port = port
         # define variables and locks you will need here
         self.cache_lock = threading.Lock()
-        self.cache = (
-            {}
-        )  # TODO Not sure if there is a size limit on this if so then what process do I use to remove items in cache
-        # self.cache = LRUCache(CACHE_SIZE)
+        self.cache = LRUCache(CACHE_SIZE)
 
     def get_dns_response(self, query):
         # input: A query and any state in self
@@ -75,17 +73,22 @@ class MyResolver(DnsResolver):
         )
         key = (sname, stype, sclass)
         now = datetime.now()
-        if key in self.cache and self.cache[key]["expire_time"] > now:
-            q.header["QR"] = 1
-            q.header["ANCOUNT"] = 1
-            q.header["AA"] = 0  # Because result is from a cache
-            # a = self.cache.get(key)  # ["resp"]
-            a = self.cache[key]["resp"]
+        a = self.cache.get(key)
 
-            a["TTL"] = int(
-                (self.cache[key]["expire_time"] - now).total_seconds()
-            )  # NOTE because "a" is a reference and not a copy so the cache object will change
-            q.answers.append(a)
+        if a:
+            a = [record for record in a if record["expire_time"] > now]
+            with self.cache_lock:  # Get rid of expire records
+                self.cache.put(key, a if a else None)
+        if a and any(True for record in a if record["expire_time"] > now):
+            q.header["QR"] = 1
+            q.header["ANCOUNT"] = len(a)
+            q.header["AA"] = 0  # Because result is from a cache
+            for record in a:
+                record["resp"]["TTL"] = int(
+                    (record["expire_time"] - now).total_seconds()
+                )  # NOTE because "a" is a reference and not a copy so the cache object will change
+
+            q.answers.extend([r["resp"] for r in a])
             return q.to_bytes()
 
         else:
@@ -97,16 +100,19 @@ class MyResolver(DnsResolver):
             answer = sock.recv(512)
             a = DNSQuery(answer)
             # TODO Make this into a method so that we cache every time the resolver fetches during iterative query
+
+            new_rr = defaultdict(list)
             for record in a.answers:
-                # if record["TYPE"]
+                # TODO if record["TYPE"] # Are certain types like SOA we don't cache
                 key = (record["NAME"].decode("utf-8"), record["TYPE"], record["CLASS"])
-                with self.cache_lock:
-                    self.cache[key] = {
-                        "insert_time": datetime.now(),
-                        "expire_time": datetime.now()
-                        + timedelta(seconds=record["TTL"]),
-                        "resp": record,
-                    }
+                val = {
+                    "expire_time": datetime.now() + timedelta(seconds=record["TTL"]),
+                    "resp": record,
+                }
+                new_rr[key].append(val)
+            with self.cache_lock:
+                for key, val in new_rr.items():
+                    self.cache.put(key, val)
             print("%%")
             print([[str(num) for num in record["RDATA"]] for record in a.answers])
             print(a)
