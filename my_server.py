@@ -15,6 +15,11 @@ from collections import defaultdict, OrderedDict
 MAX_LEVEL = 10  # max number of iterative queries we make before we stop
 CACHE_SIZE = 10000
 
+# TYPE Values
+A_TYPE = 1
+NS_TYPE = 3
+CNAME_TYPE = 5
+
 
 class LRUCache:
     def __init__(self, Capacity):
@@ -47,26 +52,22 @@ class MyResolver(DnsResolver):
     def check_Cache(self, key, now):
         a = self.cache.get(key)
         if a:
-            a = [record for record in a if record["expire_time"] > now]
-            # Get rid of expire records
+            a = [record for record in a if record["expire_time"] > now]  # Get rid of expired records
             self.cache.put(key, a if a else None)
+        return a
 
     def query_then_cache(self, name_server, q):
         ### Regular Query
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.bind(("", 7000))
-        sock.connect(
-            (name_server, 53)
-        )  # Dutch Dns Server that supports non recursive queries
+        sock.connect((name_server, 53))
         q.header["RD"] = 0  # we do not want recursive query
         sock.send(q.to_bytes())
         answer = sock.recv(512)
         a = DNSQuery(answer)
-        # TODO Make this into a method so that we cache every time the resolver fetches during iterative query
 
         new_rr = defaultdict(list)
         for record in a.answers:
-            # TODO if record["TYPE"] # Are certain types like SOA we don't cache
             key = (
                 record["NAME"].decode("utf-8"),
                 record["TYPE"],
@@ -114,9 +115,9 @@ class MyResolver(DnsResolver):
             q.question["QCLASS"],
         )
 
-        def recursive_lookup(sname, stype, sclass, now=datetime.now()):
-            if (
-                datetime.now() - now > 100
+        def recursive_lookup(sname, stype, sclass, now=datetime.now(), limit=180):
+            if (datetime.now() - now) > timedelta(
+                seconds=limit
             ):  # look up took longer than 100s we should return an error
                 q.header["QR"] = 1
                 q.header["RCODE"] = 2
@@ -129,7 +130,7 @@ class MyResolver(DnsResolver):
             key = (sname, stype, sclass)
             ### STEP 1 ###
             a = self.check_Cache(key, now)
-            if a and any(True for record in a if record["expire_time"] > now):
+            if a:
                 q.header["QR"] = 1
                 q.header["ANCOUNT"] = len(a)
                 q.header["AA"] = 0  # Because result is from a cache
@@ -142,65 +143,55 @@ class MyResolver(DnsResolver):
                 return q.to_bytes()
 
             while True:
-
                 ### STEP 2 ###
-                sbelt = ["195.129.12.83", "199.9.14.201"]  # A and B root server
+                sbelt = [
+                    "195.129.12.83",
+                    "198.41.0.4",
+                    "199.9.14.201",
+                ]  # A and B root server
                 slist = []
-                while sname:
-                    key = (sname, stype, sclass)
-                    if a := self.check_Cache(key, now):
+                split_sname = sname.split(".")
+                for i in range(len(split_sname)):
+                    reduced_sname = ".".join(split_sname[i:])
+                    reduced_key = (reduced_sname, A_TYPE, sclass)
+                    if a := self.check_Cache(reduced_key, now):
                         slist.append(a["RDATA"])  # put the ip address of the server
+                    else:
+                        # TODO Kick off parallel process to look for the ip addresses of said server
+                        a = recursive_lookup(*reduced_key, now, 10)
+
                 slist.extend(sbelt)
 
                 ### STEP 3 ###
                 for server in slist:
-
-                    ### STEP 4 ###
                     a = self.query_then_cache(server, q)
 
-                    ### STEP 4.1 ###
+                    ### STEP 4 ###
+                    gotAns = self.check_Cache(key, now)
 
-                    if (a.answers and a.header["RCODE"] == 0) or a.header[
+                    ### STEP 4.1 ###
+                    if (gotAns and a.header["RCODE"] == 0) or a.header[
                         "RCODE"
                     ] == 3:  # TODO Maybe we need to check if domain name and type of answer section matches with original query
                         return a.to_bytes()
 
                     ### STEP 4.2 ###
-                    elif a.answer and (
-                        ns_rec := [rec for rec in a.answers if rec["TYPE"] == 2]
+                    elif a.answers and (
+                        [rec for rec in a.answers if rec["TYPE"] == NS_TYPE]
                     ):  # if there is an NS Record
-                        break
+                        break  # NOTE: Why this works?: After caching we can now query this recently found name server for more info on our sname
 
                     ### STEP 4.3 ###
                     elif a.answers and (
-                        cname_rec := [rec for rec in a.answers if rec["TYPE"] == 5]
+                        cname_rec := [rec for rec in a.answers if rec["TYPE"] == CNAME_TYPE]
                     ):  # if there is a CNAME Record
-                        return recursive_lookup(
-                            cname_rec[0]["RDATA"], stype, sclass, now
-                        )
+                        return recursive_lookup(cname_rec[0]["RDATA"], stype, sclass, now)
 
                     ### STEP 4.4 ###
                     # Go to the next server
                     # continue
 
-
-# def lookup(self, qname: str, ns):
-#     """
-#     setups and sends a dns query to a name server
-
-#     returns query
-#     """
-# 	sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-#     sock.bind((ns, 7000))
-#     sock.connect((, 53))
-#     sock.send(q.to_bytes())
-#     answer = sock.recv(512)
-#     a = DNSQuery(answer)
-#     print("%%")
-#     print([[str(num) for num in record["RDATA"]] for record in a.answers])
-#     print(a)
-#     # print(a.to_bytes())
-#     return a.to_bytes()
+        recursive_lookup(sname, stype, sclass)
 
 
 parser = argparse.ArgumentParser(description="""This is a DNS resolver""")
