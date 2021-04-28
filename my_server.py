@@ -1,5 +1,3 @@
-# Abraham Gale 2020
-# feel free to add functions to this part of the project, just make sure that the get_dns_response function works
 from os import WIFSTOPPED
 from resolver_backround import DnsResolver
 import threading
@@ -12,6 +10,8 @@ from helper_funcs import DNSQuery
 from datetime import datetime, timedelta
 from collections import defaultdict, OrderedDict
 import copy
+import random
+import ipaddress
 
 MAX_LEVEL = 10  # max number of iterative queries we make before we stop
 CACHE_SIZE = 100000
@@ -52,49 +52,60 @@ class MyResolver(DnsResolver):
         self.port = port
         # define variables and locks you will need here
         self.cache = LRUCache(CACHE_SIZE)
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind(("", 7000))
 
     def check_Cache(self, key, now):
         a = self.cache.get(key)
         if a:
             a = [record for record in a if record["expire_time"] > now]  # Get rid of expired records
             self.cache.put(key, a if a else None)
-            return a["resp"]
-        else:
-            None
+            return list(map(lambda rec: rec["resp"], a))
+        return None
+
+    def check_Cache_ret_time(self, key, now):
+        ### Only difference is that this method also returns the expire time
+        a = self.cache.get(key)
+        if a:
+            a = [record for record in a if record["expire_time"] > now]  # Get rid of expired records
+            self.cache.put(key, a if a else None)
+            return a
+        return None
 
     def query_then_cache(self, name_server, q):
-        ### Regular Query
-        print("QUERYING this server", name_server)
-        try:
-            self.sock.connect((name_server, 53))
-            q.header["RD"] = 0  # we do not want recursive query
-            self.sock.send(q.to_bytes())
-            answer = self.sock.recv(512)
-            a = DNSQuery(answer)
+        ### Query
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("", 8000))
+        name_server = str(ipaddress.ip_address(name_server))
+        sock.connect((name_server, 53))
 
-            if a.header["RCODE"] == NOERROR_RCODE:
-                new_rr = defaultdict(list)
-                for record in a.answers:
-                    key = (
-                        record["NAME"].decode("utf-8"),
-                        record["TYPE"],
-                        record["CLASS"],
-                    )
-                    val = {
-                        "expire_time": datetime.now() + timedelta(seconds=record["TTL"]),
-                        "resp": record,
-                    }
-                    new_rr[key].append(val)
-                for key, val in new_rr.items():
-                    self.cache.put(key, val)
-            print("%%")
-            # print([[str(num) for num in record["RDATA"]] for record in a.answers])
-            print(a)
-            return a
-        except:
-            return q  # NOTE Something with no answers inside of it
+        q.header["RD"] = 0  # we do not want recursive query
+        sock.sendall(q.to_bytes())
+        answer = sock.recv(512)
+        sock.close()
+
+        a = DNSQuery(answer)
+        ### Caching
+
+        if a.header["RCODE"] == NOERROR_RCODE:
+            new_rr = defaultdict(list)
+            for record in a.answers:
+                key = (
+                    record["NAME"].decode("utf-8"),
+                    record["TYPE"],
+                    record["CLASS"],
+                )
+                val = {
+                    "expire_time": datetime.now() + timedelta(seconds=record["TTL"]),
+                    "resp": record,
+                }
+                new_rr[key].append(val)
+            for key, val in new_rr.items():
+                self.cache.put(key, val)
+        print("%%")
+        # print([[str(num) for num in record["RDATA"]] for record in a.answers])
+        print(a)
+
+        return a
 
     def get_dns_response(self, query):
         # input: A query and any state in self
@@ -121,11 +132,11 @@ class MyResolver(DnsResolver):
             q.question["QTYPE"],
             q.question["QCLASS"],
         )
-        # return self.recursive_lookup(q, sname, stype, sclass)
-        return self.recursive_lookup2(q, sname, stype, sclass).to_bytes()
 
-    def recursive_lookup2(self, q, sname, stype, sclass, now=datetime.now(), limit=180):
-        if (datetime.now() - now) > timedelta(seconds=limit):  # look up took longer than 100s we should return an error
+        return self.recursive_lookup(q, sname, stype, sclass).to_bytes()
+
+    def recursive_lookup(self, q, sname, stype, sclass, now=datetime.now(), limit=180):
+        if (datetime.now() - now) > timedelta(seconds=limit):  # look up took longer than 100s
             q.header["QR"] = 1
             q.header["RCODE"] = 2
             q.header["ANCOUNT"] = 0
@@ -136,95 +147,77 @@ class MyResolver(DnsResolver):
 
         key = (sname, stype, sclass)
         ### STEP 1 ###
-        a = self.check_Cache(key, now)
+        a = self.check_Cache_ret_time(key, now)
         if a:
             q.header["QR"] = 1
             q.header["ANCOUNT"] = len(a)
             q.header["AA"] = 0  # Because result is from a cache
             for record in a:
-                record["TTL"] = int((record["expire_time"] - now).total_seconds())
-            q.answers = a
+                record["resp"]["TTL"] = int((record["expire_time"] - datetime.now()).total_seconds())
+            q.answers = [rec["resp"] for rec in a]
             return q
 
-        sbelt = [
-            "198.41.0.4",
-            "199.9.14.201",
-            "195.129.12.83",
-        ]  # A and B root server
-        slist = []
-        print("WHAT IS", sname)
-        split_sname = sname.split(".")
-        for i in range(len(split_sname)):
-            reduced_sname = ".".join(split_sname[i:])
-            reduced_key = (reduced_sname, NS_TYPE, sclass)
-            ns_records = self.check_Cache(reduced_key, now)
-            a = None
-            if ns_records:
-                for ns in ns_records:
-                    reduced_key = (ns, A_TYPE, sclass)
-                    a = self.check_Cache(reduced_key, now)
-                if a:  # append the ip of name servers
-                    slist.append(a["RDATA"])
-            else:
-                # TODO Kick off parallel process to look for the ip addresses of said server
-                # reduced_key = (reduced_sname, A_TYPE, sclass)
-                # parallel_thread = threading.Thread(target=self.recursive_lookup, args=(q, *reduced_key, now, 10))
-                # parallel_thread.start()
-                pass
-                # a = recursive_lookup(*reduced_key, now, 10) Deprecated
-        slist.extend(sbelt)
+        while True:
+            ### STEP 2 ###
+            sbelt = [
+                "198.41.0.4",
+                "199.9.14.201",
+                "195.129.12.83",
+            ]  # A and B root server
+            slist = []
+            split_sname = sname.split(".")
+            for i in range(len(split_sname)):
+                reduced_sname = ".".join(split_sname[i:])
+                reduced_key = (reduced_sname, NS_TYPE, sclass)
+                ns_records = self.check_Cache(reduced_key, now)
+                if ns_records:
+                    for ns in ns_records:
+                        ns_name = ns["RDATA"][0]
+                        reduced_key = (ns_name.decode("utf-8"), A_TYPE, sclass)
+                        if a := self.check_Cache(reduced_key, now):  # append the ip of name servers
+                            random_a = random.choice(a)
+                            slist.extend(random_a["RDATA"])
+                if ns_records and not slist:
+                    # TODO Kick off parallel process to look for the ip addresses of NS server
+                    # parallel_thread = threading.Thread(target=self.recursive_lookup, args=(q, *reduced_key, now, 30))
+                    # parallel_thread.start()
 
-        for ns in slist:
-            while True:
-                # ns_copy = ns
+                    ### SINGLE THREAD For now
+                    original_name = q.question["NAME"]
+                    q.question["NAME"] = ns_name
+                    reduced_key = (ns_name.decode("utf-8"), A_TYPE, sclass)
+                    _ = self.recursive_lookup(q, *reduced_key, now, 60)
+                    a = self.check_Cache(reduced_key, now)
+                    slist.extend(random.choice(a)["RDATA"])
+                    q.question["NAME"] = original_name
+
+            slist.extend(sbelt)
+
+            ### STEP 3 ###
+            for ns in slist:
                 a = self.query_then_cache(ns, q)
+
+                ### STEP 4 ###
                 gotAns = self.check_Cache(key, now)
 
-                if (gotAns and a.header["RCODE"] == NOERROR_RCODE) or a.header["RCODE"] == NAMEERROR_RCODE:
+                ### STEP 4.1 ###
+                if (gotAns and a.header["RCODE"] == NOERROR_RCODE) or a.header[
+                    "RCODE"
+                ] == NAMEERROR_RCODE:  # We found it or there's an ans
                     return a
 
-                elif a.answers and (ns_records := [rec for rec in a.answers if rec["TYPE"] == NS_TYPE]):
-
-                    # Resolve the NS Record:
-                    # resolved = []
-                    unresolved = []
-                    A_records = [rec for rec in a.answers if rec["TYPE"] == A_TYPE]
-                    # print("NS!!!", ns_records)
-                    # print("IP!!!", A_records)
-                    for ns_record in ns_records:
-                        match = filter(lambda A_record: A_record["NAME"] == ns_record["RDATA"][0], A_records)
-                        if match:
-                            temp = next(match)
-                            ns = str(temp["RDATA"][0])
-                            break
-                        else:
-                            unresolved.append(ns_record)
-                    else:
-                        if not unresolved:
-                            return a
-                        # No additional section for A records
-                        ad_hoc_question = copy.copy(q)
-                        ad_hoc_question.question["NAME"] = unresolved[0]
-
-                        resolved_ns = self.query_then_cache(
-                            ns, ad_hoc_question
-                        )  # pick any of the unresolved ns records
-
-                        temp = [rec for rec in a.answers if rec["TYPE"] == A_TYPE]
-                        if temp:
-                            ns = temp[0]["RDATA"][0]
-                        else:
-                            return a
-
-                elif a.answers and (
-                    cname_rec := [rec for rec in a.answers if rec["TYPE"] == CNAME_TYPE]
-                ):  # if there is a CNAME Record
-                    new_sname = cname_rec[0]["RDATA"][0].decode("utf-8")  # TODO Not sure if this is valid works so far
-                    print("CNAME -> SNAME", new_sname)
-                    return self.recursive_lookup2(new_sname, stype, sclass, now)
-
-                else:
+                ### STEP 4.2 ###
+                elif a.answers and (ns_records := [rec for rec in a.answers if rec["TYPE"] == NS_TYPE]):  # NSNAME
                     break
+
+                ### STEP 4.3 ###
+                elif a.answers and (cname_rec := [rec for rec in a.answers if rec["TYPE"] == CNAME_TYPE]):  # CNAME
+                    new_sname = random.choice(cname_rec)["RDATA"][0]
+                    original_name = q.question["NAME"]
+                    q.question["NAME"] = new_sname
+                    resp = self.recursive_lookup(q, new_sname.decode("utf-8"), stype, sclass, now)
+                    resp.question["NAME"] = original_name
+                    return resp
 
 
 parser = argparse.ArgumentParser(description="""This is a DNS resolver""")
