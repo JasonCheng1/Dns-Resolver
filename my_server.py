@@ -135,8 +135,9 @@ class MyResolver(DnsResolver):
 
         return self.recursive_lookup(q, sname, stype, sclass).to_bytes()
 
-    def recursive_lookup(self, q, sname, stype, sclass, now=datetime.now(), limit=180):
+    def recursive_lookup(self, q, sname, stype, sclass, now=datetime.now(), limit=120):
         if (datetime.now() - now) > timedelta(seconds=limit):  # look up took longer than 100s
+            print("Query Timed Out")
             q.header["QR"] = 1
             q.header["RCODE"] = 2
             q.header["ANCOUNT"] = 0
@@ -184,11 +185,14 @@ class MyResolver(DnsResolver):
 
                     ### SINGLE THREAD For now
                     original_name = q.question["NAME"]
-                    q.question["NAME"] = ns_name
-                    reduced_key = (ns_name.decode("utf-8"), A_TYPE, sclass)
-                    _ = self.recursive_lookup(q, *reduced_key, now, 60)
-                    a = self.check_Cache(reduced_key, now)
-                    slist.extend(random.choice(a)["RDATA"])
+                    for ns in ns_records:
+                        ns_name = ns["RDATA"][0]
+                        q.question["NAME"] = ns_name
+                        reduced_key = (ns_name.decode("utf-8"), A_TYPE, sclass)
+                        _ = self.recursive_lookup(q, *reduced_key, now, 60)
+                        a = self.check_Cache(reduced_key, now)
+                        if a:
+                            slist.extend(random.choice(a)["RDATA"])
                     q.question["NAME"] = original_name
 
             slist.extend(sbelt)
