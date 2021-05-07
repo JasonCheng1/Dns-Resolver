@@ -2,7 +2,6 @@ from os import WIFSTOPPED
 from resolver_backround import DnsResolver
 import threading
 import socket
-import struct
 import argparse
 from sys import argv
 from helper_funcs import DNSQuery
@@ -29,7 +28,7 @@ MINFO_TYPE = 14
 MX_TYPE = 15
 TXT_TYPE = 16
 ANY_TYPE = 255
-# ANY_TYPE = [A_TYPE, NS_TYPE, CNAME_TYPE, SOA_TYPE, WKS_TYPE, PTR_TYPE, HINFO_TYPE, MINFO_TYPE, MX_TYPE, TXT_TYPE]
+TYPES = [A_TYPE, NS_TYPE, CNAME_TYPE, SOA_TYPE, WKS_TYPE, PTR_TYPE, HINFO_TYPE, MINFO_TYPE, MX_TYPE, TXT_TYPE]
 
 # RCODE Values
 NOERROR_RCODE = 0
@@ -67,8 +66,6 @@ class MyResolver(DnsResolver):
         self.cache = LRUCache(CACHE_SIZE)
 
     def check_Cache(self, key, now):
-        # if key[1] == ANY_TYPE:
-        #     return None
 
         a = self.cache.get(key)
 
@@ -135,7 +132,7 @@ class MyResolver(DnsResolver):
         if not __debug__:
             print(f"Q {destination_address_1}: ", q)
 
-        read, _, _ = select.select([sock], [], [], 15)  # Timeout after 15 sec
+        read, _, _ = select.select([sock], [], [], 8)  # Timeout after 15 sec
         if read:
             answer, (destination_address_2, destination_port_2) = sock.recvfrom(1024)
         else:
@@ -179,6 +176,7 @@ class MyResolver(DnsResolver):
                 self.cache.put(key, val)
 
         # TODO Support Negative Caching
+        # https://tools.ietf.org/html/rfc2308#section-5 and section-6
         # else a.header["RCODE"] == NXDOMAIN ...
 
         if not __debug__:
@@ -214,13 +212,24 @@ class MyResolver(DnsResolver):
             q.question["QCLASS"],
         )
 
-        # TODO Handle ANY Query
-        # if stype == ANY_TYPE:
-        #     for record_type in ANY_TYPE:
-        #         check if (sname, record_type, sclass) in cache:
-        #             append rec to q.answer
-        #     q.header["ANCOUNT] = len(q.answer)
-        # return
+        ### TODO Handle norecurse
+        #
+
+        ### Handle ANY Query
+        # Traverse through cache get anything that matches with sname
+        if stype == ANY_TYPE:
+            q.header["QR"] = 1
+            q.header["AA"] = 0  # Because result is from a cache
+            q.header["RA"] = 1
+            now = datetime.now()
+            for record_type in TYPES:
+                new_key = (sname, record_type, sclass)
+                if (a := self.check_Cache_ret_time(new_key, now)) :
+                    for record in a:
+                        record["resp"]["TTL"] = int((record["expire_time"] - now).total_seconds())
+                    q.answers.extend([rec["resp"] for rec in a])
+            q.header["ANCOUNT"] = len(q.answers)
+            return q.to_bytes()
 
         return self.recursive_lookup(
             q, sname, stype, sclass, datetime.now()
@@ -229,8 +238,7 @@ class MyResolver(DnsResolver):
     def recursive_lookup(self, q, sname, stype, sclass, now=datetime.now(), limit=60):
         key = (sname, stype, sclass)
         ### STEP 1 ###
-        a = self.check_Cache_ret_time(key, now)
-        if a:
+        if (a := self.check_Cache_ret_time(key, now)) :
             q.header["QR"] = 1
             q.header["ANCOUNT"] = len(a)
             q.header["AA"] = 0  # Because result is from a cache
@@ -243,7 +251,7 @@ class MyResolver(DnsResolver):
             return q  ### RETURNING
 
         while True:
-            if (a := self.check_timeout(q, now, limit)) :
+            if (a := self.check_timeout(q, now, limit)) :  # Query has taken too long
                 return a
 
             slist = self.build_slist(q, *key, now)
@@ -251,8 +259,6 @@ class MyResolver(DnsResolver):
                 print("SLIST: ", slist)
             ### STEP 3 ###
             for ns in slist:
-                name_server = str(ipaddress.ip_address(ns))  # DEBUGGING PURPOSES
-
                 a = self.query_then_cache(ns, q)
 
                 ### STEP 4 ###
